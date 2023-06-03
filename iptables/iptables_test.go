@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -130,7 +131,7 @@ func runChainTests(t *testing.T, ipt *IPTables) {
 	chain := randChain(t)
 
 	// Saving the list of chains before executing tests
-	originaListChain, err := ipt.ListChains("filter")
+	originalListChain, err := ipt.ListChains("filter")
 	if err != nil {
 		t.Fatalf("ListChains of Initial failed: %v", err)
 	}
@@ -203,8 +204,8 @@ func runChainTests(t *testing.T, ipt *IPTables) {
 	if err != nil {
 		t.Fatalf("ListChains failed: %v", err)
 	}
-	if !reflect.DeepEqual(originaListChain, listChain) {
-		t.Fatalf("ListChains mismatch: \ngot  %#v \nneed %#v", originaListChain, listChain)
+	if !reflect.DeepEqual(originalListChain, listChain) {
+		t.Fatalf("ListChains mismatch: \ngot  %#v \nneed %#v", originalListChain, listChain)
 	}
 
 	// ChainExists must not find it anymore
@@ -293,6 +294,11 @@ func runRulesTests(t *testing.T, ipt *IPTables) {
 		t.Fatalf("Insert failed: %v", err)
 	}
 
+	err = ipt.InsertUnique("filter", chain, 2, "-s", subnet2, "-d", address2, "-j", "ACCEPT")
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
 	err = ipt.Insert("filter", chain, 1, "-s", subnet1, "-d", address2, "-j", "ACCEPT")
 	if err != nil {
 		t.Fatalf("Insert failed: %v", err)
@@ -330,21 +336,19 @@ func runRulesTests(t *testing.T, ipt *IPTables) {
 		t.Fatalf("ListWithCounters failed: %v", err)
 	}
 
-	suffix := " -c 0 0 -j ACCEPT"
-	if ipt.mode == "nf_tables" {
-		suffix = " -j ACCEPT -c 0 0"
+	makeExpected := func(suffix string) []string {
+		return []string{
+			"-N " + chain,
+			"-A " + chain + " -s " + subnet1 + " -d " + address1 + " " + suffix,
+			"-A " + chain + " -s " + subnet2 + " -d " + address2 + " " + suffix,
+			"-A " + chain + " -s " + subnet2 + " -d " + address1 + " " + suffix,
+			"-A " + chain + " -s " + address1 + " -d " + subnet2 + " " + suffix,
+		}
 	}
-
-	expected = []string{
-		"-N " + chain,
-		"-A " + chain + " -s " + subnet1 + " -d " + address1 + suffix,
-		"-A " + chain + " -s " + subnet2 + " -d " + address2 + suffix,
-		"-A " + chain + " -s " + subnet2 + " -d " + address1 + suffix,
-		"-A " + chain + " -s " + address1 + " -d " + subnet2 + suffix,
-	}
-
-	if !reflect.DeepEqual(rules, expected) {
-		t.Fatalf("ListWithCounters mismatch: \ngot  %#v \nneed %#v", rules, expected)
+	// older nf_tables returned the second order
+	if !reflect.DeepEqual(rules, makeExpected("-c 0 0 -j ACCEPT")) &&
+		!reflect.DeepEqual(rules, makeExpected("-j ACCEPT -c 0 0")) {
+		t.Fatalf("ListWithCounters mismatch: \ngot  %#v \nneed %#v", rules, makeExpected("<-c 0 0 and -j ACCEPT in either order>"))
 	}
 
 	stats, err := ipt.Stats("filter", chain)
@@ -674,6 +678,72 @@ func TestExtractIptablesVersion(t *testing.T) {
 				t.Fatalf("expected %d %d %d %s, got %d %d %d %s",
 					tt.v1, tt.v2, tt.v3, tt.mode,
 					v1, v2, v3, mode)
+			}
+		})
+	}
+}
+
+func TestListById(t *testing.T) {
+	testCases := []struct {
+		in       string
+		id       int
+		out      string
+		expected bool
+	}{
+		{
+			"-i lo -p tcp -m tcp --dport 3000 -j DNAT --to-destination 127.0.0.1:3000",
+			1,
+			"-A PREROUTING -i lo -p tcp -m tcp --dport 3000 -j DNAT --to-destination 127.0.0.1:3000",
+			true,
+		},
+		{
+			"-i lo -p tcp -m tcp --dport 3000 -j DNAT --to-destination 127.0.0.1:3001",
+			2,
+			"-A PREROUTING -i lo -p tcp -m tcp --dport 3000 -j DNAT --to-destination 127.0.0.1:3001",
+			true,
+		},
+		{
+			"-i lo -p tcp -m tcp --dport 3000 -j DNAT --to-destination 127.0.0.1:3002",
+			3,
+			"-A PREROUTING -i lo -p tcp -m tcp --dport 3000 -j DNAT --to-destination 127.0.0.1:3003",
+			false,
+		},
+	}
+
+	ipt, err := New()
+	if err != nil {
+		t.Fatalf("failed to init: %v", err)
+	}
+	// ensure to test in a clear environment
+	err = ipt.ClearChain("nat", "PREROUTING")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		err = ipt.ClearChain("nat", "PREROUTING")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	for _, tt := range testCases {
+		t.Run(fmt.Sprintf("Checking rule with id %d", tt.id), func(t *testing.T) {
+			err = ipt.Append("nat", "PREROUTING", strings.Split(tt.in, " ")...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rule, err := ipt.ListById("nat", "PREROUTING", tt.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fmt.Println(rule)
+			test_result := false
+			if rule == tt.out {
+				test_result = true
+			}
+			if test_result != tt.expected {
+				t.Fatal("Test failed")
 			}
 		})
 	}
